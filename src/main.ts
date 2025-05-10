@@ -2,29 +2,135 @@ import * as w4 from "./wasm4";
 
 // Constants
 const GRAVITY: f32 = 0.4;
-const JUMP_FORCE: f32 = -5.5;
+const INITIAL_JUMP_FORCE: f32 = -5.5;  // Initial upward velocity
+const MIN_JUMP_FORCE: f32 = -3.0;      // Minimum jump height (for short taps)
+const MAX_JUMP_FORCE: f32 = -7.0;      // Maximum jump height (for held button)
+const JUMP_HOLD_GRAVITY: f32 = 0.25;   // Reduced gravity while holding jump
 const MOVE_SPEED: f32 = 1.8;
 const GROUND_FRICTION: f32 = 0.8;
 const AIR_FRICTION: f32 = 0.95;
 const TERMINAL_VELOCITY: f32 = 7.0;
 const COYOTE_TIME: u32 = 6; // frames where player can still jump after leaving a platform
 const MAX_PLATFORMS: i32 = 20; // maximum number of platforms
+const MAX_JUMP_HOLD_FRAMES: u32 = 12; // Maximum frames to hold jump for height control
 
 // Tile system constants
 const TILE_SIZE: i32 = 7; // 7x7 tiles for level
 const LEVEL_WIDTH: i32 = 23; // 160 / 7 = ~23 tiles wide
-const LEVEL_HEIGHT: i32 = 23; // 160 / 7 = ~23 tiles high
+const LEVEL_HEIGHT: i32 = 27; // 23 tiles + 4 extra ground rows
 const PLAYER_WIDTH: i32 = 8; // 8 pixels wide for player sprites
 const PLAYER_HEIGHT: i32 = 12; // 12 pixels tall for player sprites
 
 // Game state
 let prevGamepad: u8 = 0;
+let cameraY: f32 = 0; // Camera Y position (for vertical scrolling)
+let highestPlatformY: i32 = 0; // Track the Y position of the highest platform
+let platformsGenerated: i32 = 0; // Track how many platforms have been generated
+
+// Lava state
+let lavaY: f32 = 250; // Starting position of the lava pool (below the screen)
+const LAVA_RISE_SPEED_MIN: f32 = 0.2; // Base speed for lava rise
+const LAVA_RISE_SPEED_MAX: f32 = 4.0; // Maximum speed when rubber-banding
+const LAVA_RUBBER_BAND_DISTANCE: f32 = 10; // Distance at which rubber-banding begins
+let currentLavaSpeed: f32 = LAVA_RISE_SPEED_MIN; // Current speed of the lava
+const MAX_LAVA_DROPS: i32 = 10; // Maximum number of lava drops in the stream
+const LAVA_STREAM_X: i32 = 140; // X position of the lava stream (right side)
+
+// Lava drop class for the falling stream
+class LavaDrop {
+    x: f32;
+    y: f32;
+    size: f32;
+    speed: f32;
+    xVelocity: f32; // Horizontal movement
+    wobblePhase: f32; // For additional side-to-side motion
+    wobbleAmount: f32; // How much the drop wobbles
+
+    constructor(y: f32) {
+        this.x = f32(LAVA_STREAM_X + (Math.random() * 10) - 5); // Randomize a bit around stream center
+        this.y = y;
+        this.size = f32(3.0 + Math.random() * 5.0); // Bigger drops: 3-8 pixels
+        this.speed = f32(1.5 + Math.random() * 2.0); // Random speed
+        this.xVelocity = f32((Math.random() - 0.5) * 0.8); // Random gentle horizontal drift
+        this.wobblePhase = f32(Math.random() * 6.28); // Random starting phase (0 to 2π)
+        this.wobbleAmount = f32(0.3 + Math.random() * 0.5); // Amount of wobble
+    }
+
+    update(): void {
+        // Move down with speed
+        this.y += this.speed;
+
+        // Apply horizontal movement with wobble effect
+        this.x += this.xVelocity;
+        this.wobblePhase += 0.1; // Advance wobble phase
+        this.x += f32(Math.sin(f64(this.wobblePhase)) * f64(this.wobbleAmount)); // Add wobble motion
+
+        // Keep drops within reasonable bounds of the stream
+        if (Math.abs(this.x - f32(LAVA_STREAM_X)) > 20) {
+            // Nudge back toward center if drifting too far
+            this.x += (f32(LAVA_STREAM_X) - this.x) * 0.05;
+        }
+
+        // If hit the lava pool, respawn at top with splash effect
+        if (this.y > lavaY - cameraY) {
+            // Play splash sound for larger drops (but not for every drop to avoid noise)
+            if (this.size > 5.0 && Math.random() < 0.4) {
+                w4.tone(300 | (200 << 16), 3, 30, w4.TONE_NOISE);
+            }
+
+            this.y = f32(-10 - Math.random() * 20); // Stagger respawn heights
+            this.x = f32(LAVA_STREAM_X + (Math.random() * 16) - 8); // More spread for respawning
+            this.size = f32(3.0 + Math.random() * 5.0); // Bigger drops
+            this.speed = f32(1.5 + Math.random() * 2.0);
+            this.xVelocity = f32((Math.random() - 0.5) * 0.8);
+            this.wobblePhase = f32(Math.random() * 6.28);
+            this.wobbleAmount = f32(0.3 + Math.random() * 0.5);
+        }
+    }
+
+    draw(): void {
+        store<u16>(w4.DRAW_COLORS, 8); // Color 3 (red) for lava
+
+        // Draw bigger oval for larger drops
+        const width = u32(this.size);
+        const height = u32(this.size * 1.2); // Slightly taller than wide for teardrop effect
+        w4.oval(i32(this.x - this.size/2), i32(this.y), width, height);
+
+        // Add a highlight to larger drops
+        if (this.size > 5.0) {
+            store<u16>(w4.DRAW_COLORS, 1); // Color 0 (light green) for highlight
+            w4.oval(i32(this.x - this.size/6), i32(this.y + this.size/4), u32(this.size/4), u32(this.size/4));
+        }
+    }
+}
+
+// Create the lava stream drops
+const lavaDrops: LavaDrop[] = [];
 
 // Tile types
 enum TileType {
     Empty = 0,
     Solid = 1,
-    Platform = 2
+    // Regular platforms (2-4)
+    PlatformLeft = 2,
+    PlatformMiddle = 3,
+    PlatformRight = 4,
+    // Jump-through platforms (5-7)
+    JumpThroughLeft = 5,
+    JumpThroughMiddle = 6,
+    JumpThroughRight = 7,
+    // Corner tiles for regular platforms (8-9)
+    PlatformCornerLeft = 8,
+    PlatformCornerRight = 9,
+    // Corner tiles for jump-through platforms (10-11)
+    JumpThroughCornerLeft = 10,
+    JumpThroughCornerRight = 11,
+    // Variant middle tiles for platforms (12-13)
+    PlatformMiddleVariant1 = 12,
+    PlatformMiddleVariant2 = 13,
+    // Variant middle tiles for jump-through platforms (14-15)
+    JumpThroughMiddleVariant1 = 14,
+    JumpThroughMiddleVariant2 = 15
 }
 
 // Tile sprites (7x7 pixels)
@@ -78,6 +184,121 @@ const tilePlatformRight = memory.data<u8>([
     0b1111111,
 ]);
 
+// Corner tiles for regular platforms
+const tilePlatformCornerLeft = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000001,
+    0b0000011,
+    0b0111111,
+    0b1111111,
+    0b1111111,
+]);
+
+const tilePlatformCornerRight = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b1000000,
+    0b1100000,
+    0b1111110,
+    0b1111111,
+    0b1111111,
+]);
+
+// Variant middle tiles for regular platforms
+const tilePlatformMiddleVariant1 = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0001000,
+    0b1111111,
+    0b1111111,
+    0b1111111,
+]);
+
+const tilePlatformMiddleVariant2 = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b1111111,
+    0b1110111,
+    0b1111111,
+]);
+
+// Jump-through platform tiles (player can jump up through these)
+const tileJumpThroughLeft = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0111111,
+    0b0111111,
+    0b0110011,
+]);
+
+const tileJumpThroughMiddle = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b1111111,
+    0b1111111,
+    0b1100111,
+]);
+
+const tileJumpThroughRight = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b1111110,
+    0b1111110,
+    0b1100110,
+]);
+
+// Corner tiles for jump-through platforms
+const tileJumpThroughCornerLeft = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000001,
+    0b0000011,
+    0b0111111,
+    0b0111111,
+    0b0110011,
+]);
+
+const tileJumpThroughCornerRight = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b1000000,
+    0b1100000,
+    0b1111110,
+    0b1111110,
+    0b1100110,
+]);
+
+// Variant middle tiles for jump-through platforms
+const tileJumpThroughMiddleVariant1 = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0001000,
+    0b1111111,
+    0b1111111,
+    0b1100111,
+]);
+
+const tileJumpThroughMiddleVariant2 = memory.data<u8>([
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b0000000,
+    0b1111111,
+    0b1110111,
+    0b1100111,
+]);
+
 // Level data - 0=empty, 1=solid, 2=platform left, 3=platform middle, 4=platform right
 const levelData: u8[] = [
     // Row 0-2 (top of screen) - empty
@@ -122,6 +343,12 @@ const levelData: u8[] = [
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
     1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+
+    // Extra rows of ground below the visible area (rows 23-26)
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
 ];
 
 // Function to get tile at specific coordinates
@@ -157,9 +384,18 @@ function isSolidTile(tileType: u8): boolean {
     return tileType === TileType.Solid;
 }
 
-// Check if a tile is a platform
+// Check if a tile is a regular platform
 function isPlatformTile(tileType: u8): boolean {
-    return tileType >= 2 && tileType <= 4;
+    return (tileType >= 2 && tileType <= 4) || // PlatformLeft, Middle, Right
+           (tileType >= 8 && tileType <= 9) || // PlatformCornerLeft, CornerRight
+           (tileType >= 12 && tileType <= 13); // PlatformMiddleVariant1, Variant2
+}
+
+// Check if a tile is a jump-through platform
+function isJumpThroughTile(tileType: u8): boolean {
+    return (tileType >= 5 && tileType <= 7) || // JumpThroughLeft, Middle, Right
+           (tileType >= 10 && tileType <= 11) || // JumpThroughCornerLeft, CornerRight
+           (tileType >= 14 && tileType <= 15); // JumpThroughMiddleVariant1, Variant2
 }
 
 // Platform class for collision
@@ -169,45 +405,20 @@ class Platform {
     width: f32;
     height: f32;
     tileTypes: u8[] = [];
+    isJumpThrough: boolean = false;
 
-    constructor(x: f32, y: f32, width: f32, height: f32, tileTypes: u8[] = []) {
+    constructor(x: f32, y: f32, width: f32, height: f32, tileTypes: u8[] = [], isJumpThrough: boolean = false) {
         this.x = x;
         this.y = y;
         this.width = width;
         this.height = height;
         this.tileTypes = tileTypes;
+        this.isJumpThrough = isJumpThrough;
     }
 
+    // draw() method is now handled by the drawGame function with camera support
     draw(): void {
-        store<u16>(w4.DRAW_COLORS, 2); // Color 1 for platforms (dark green)
-
-        if (this.tileTypes.length > 0) {
-            // Draw using the tile types
-            const numTiles = this.tileTypes.length;
-            for (let i = 0; i < numTiles; i++) {
-                const tileType = this.tileTypes[i];
-                let sprite: usize;
-
-                if (tileType === 2) { // Platform left
-                    sprite = tilePlatformLeft;
-                } else if (tileType === 3) { // Platform middle
-                    sprite = tilePlatformMiddle;
-                } else if (tileType === 4) { // Platform right
-                    sprite = tilePlatformRight;
-                } else if (tileType === 1) { // Solid
-                    sprite = tileSolid;
-                } else {
-                    continue; // Skip empty tiles
-                }
-
-                const tileX = i32(this.x) + i * TILE_SIZE;
-                const tileY = i32(this.y);
-                w4.blit(sprite, tileX, tileY, TILE_SIZE, TILE_SIZE, w4.BLIT_1BPP);
-            }
-        } else {
-            // Fallback to rect drawing if no tiles specified
-            w4.rect(i32(this.x), i32(this.y), u32(this.width), u32(this.height));
-        }
+        // This method is no longer used, but kept for compatibility
     }
 }
 
@@ -215,6 +426,9 @@ class Platform {
 function initPlatforms(): void {
     // Clear existing platforms
     platforms.length = 0;
+
+    // Reset highest platform tracking
+    highestPlatformY = LEVEL_HEIGHT;
 
     // Scan through the tilemap looking for platform sequences
     for (let y = 0; y < LEVEL_HEIGHT; y++) {
@@ -225,7 +439,7 @@ function initPlatforms(): void {
             const tile = getTile(x, y);
 
             // If this is a platform or solid tile
-            if (isPlatformTile(tile) || isSolidTile(tile)) {
+            if (isPlatformTile(tile) || isSolidTile(tile) || isJumpThroughTile(tile)) {
                 // If this is the start of a new platform
                 if (platformStart === -1) {
                     platformStart = x;
@@ -242,8 +456,11 @@ function initPlatforms(): void {
                 const width = f32(platformTiles.length * TILE_SIZE);
                 const height = f32(TILE_SIZE);
 
+                // Determine if this is a jump-through platform by checking the first tile type
+                const isJumpThroughPlatform = isJumpThroughTile(platformTiles[0]);
+
                 // Create a new platform
-                platforms.push(new Platform(worldX, worldY, width, height, platformTiles));
+                platforms.push(new Platform(worldX, worldY, width, height, platformTiles, isJumpThroughPlatform));
 
                 // Reset for the next platform
                 platformStart = -1;
@@ -257,7 +474,11 @@ function initPlatforms(): void {
             const worldY = tileToWorldY(y);
             const width = f32(platformTiles.length * TILE_SIZE);
             const height = f32(TILE_SIZE);
-            platforms.push(new Platform(worldX, worldY, width, height, platformTiles));
+
+            // Determine if this is a jump-through platform by checking the first tile type
+            const isJumpThroughPlatform = isJumpThroughTile(platformTiles[0]);
+
+            platforms.push(new Platform(worldX, worldY, width, height, platformTiles, isJumpThroughPlatform));
         }
     }
 }
@@ -265,6 +486,95 @@ function initPlatforms(): void {
 // Initialize platforms
 const platforms: Platform[] = [];
 initPlatforms();
+
+// Generate a new platform at a given height
+function generatePlatform(yPos: i32): void {
+    // Random platform width (3-6 tiles)
+    const platformWidth = 3 + Math.floor(Math.random() * 4);
+
+    // Random platform position (leave margin on left and a 20px margin on right for lava stream)
+    // 20px is approximately 3 tiles (TILE_SIZE is 7)
+    const rightMarginTiles = 3;
+    const platformX = i32(1 + Math.floor(Math.random() * (LEVEL_WIDTH - platformWidth - rightMarginTiles - 1)));
+
+    // Create platform tiles array
+    const platformTiles: u8[] = [];
+
+    // Decide if this should be a jump-through platform (50% chance after first few platforms)
+    const isJumpThrough = (platformsGenerated > 5) && (Math.random() > 0.5);
+
+    // Set the appropriate tile types based on platform type
+    if (isJumpThrough) {
+        // 20% chance to add a left corner piece
+        if (Math.random() < 0.2) {
+            platformTiles.push(10); // JumpThroughCornerLeft
+        } else {
+            platformTiles.push(5); // JumpThroughLeft - standard left edge
+        }
+
+        // Middle tiles with variants
+        for (let i = 1; i < platformWidth - 1; i++) {
+            // Randomly select middle tile variants
+            const rand = Math.random();
+            if (rand < 0.15) {
+                platformTiles.push(14); // JumpThroughMiddleVariant1
+            } else if (rand < 0.3) {
+                platformTiles.push(15); // JumpThroughMiddleVariant2
+            } else {
+                platformTiles.push(6); // JumpThroughMiddle - standard middle
+            }
+        }
+
+        // 20% chance to add a right corner piece
+        if (Math.random() < 0.2) {
+            platformTiles.push(11); // JumpThroughCornerRight
+        } else {
+            platformTiles.push(7); // JumpThroughRight - standard right edge
+        }
+    } else {
+        // 20% chance to add a left corner piece
+        if (Math.random() < 0.2) {
+            platformTiles.push(8); // PlatformCornerLeft
+        } else {
+            platformTiles.push(2); // PlatformLeft - standard left edge
+        }
+
+        // Middle tiles with variants
+        for (let i = 1; i < platformWidth - 1; i++) {
+            // Randomly select middle tile variants
+            const rand = Math.random();
+            if (rand < 0.15) {
+                platformTiles.push(12); // PlatformMiddleVariant1
+            } else if (rand < 0.3) {
+                platformTiles.push(13); // PlatformMiddleVariant2
+            } else {
+                platformTiles.push(3); // PlatformMiddle - standard middle
+            }
+        }
+
+        // 20% chance to add a right corner piece
+        if (Math.random() < 0.2) {
+            platformTiles.push(9); // PlatformCornerRight
+        } else {
+            platformTiles.push(4); // PlatformRight - standard right edge
+        }
+    }
+
+    // Create and add platform
+    const worldX = tileToWorldX(platformX);
+    const worldY = tileToWorldY(yPos);
+    const width = f32(platformWidth * TILE_SIZE);
+    const height = f32(TILE_SIZE);
+
+    platforms.push(new Platform(worldX, worldY, width, height, platformTiles, isJumpThrough));
+
+    // Update highest platform tracking
+    if (yPos < highestPlatformY) {
+        highestPlatformY = yPos;
+    }
+
+    platformsGenerated++;
+}
 
 // Player sprites - humanoid character (12x8 pixels, inverted colors)
 const playerStanding = memory.data<u8>([
@@ -328,7 +638,7 @@ const playerJumping = memory.data<u8>([
     0b11100111, // feet pointed up
 ]);
 
-// Jump squat animation (pre-jump, squashed)
+// Jump squat animation (pre-jump, squashed) - shorter version (10 rows instead of 12)
 const playerJumpSquat = memory.data<u8>([
     0b11000011, // head
     0b10000001, // head
@@ -336,12 +646,11 @@ const playerJumpSquat = memory.data<u8>([
     0b10011001, // gritted teeth expression
     0b11000011, // neck
     0b10000001, // torso (wider)
-    0b10000001, // torso (wider)
-    0b10000001, // torso (wider)
+    0b10000001, // torso (compressed)
     0b10000001, // hips (wider)
-    0b10011001, // clearly bent legs
-    0b10100101, // squatting position
-    0b11000011, // feet firmly planted
+    0b10111101, // bent legs (wider stance)
+    0b11100111, // feet firmly planted
+    // Two rows shorter - this will be displayed as 10 rows tall
 ]);
 
 // Landing animation (squashed on landing)
@@ -395,6 +704,10 @@ class Player {
     coyoteTimeCounter: u32;
     landingTimer: u32;    // Timer for landing animation
     jumpSquatTimer: u32;  // Timer for jump squat animation
+    isJumping: boolean;   // Whether player is currently in a jump
+    jumpHoldTimer: u32;   // Tracks how long jump button is held
+    jumpReleased: boolean; // Whether jump button has been released during jump
+    prevJumpButton: boolean; // Track previous frame's jump button state
 
     constructor() {
         this.x = f32(LEVEL_WIDTH / 2 * TILE_SIZE);
@@ -411,6 +724,10 @@ class Player {
         this.coyoteTimeCounter = 0;
         this.landingTimer = 0;
         this.jumpSquatTimer = 0;
+        this.isJumping = false;
+        this.jumpHoldTimer = 0;
+        this.jumpReleased = true;
+        this.prevJumpButton = false; // Start with button not pressed
     }
 
     update(gamepad: u8): void {
@@ -421,6 +738,10 @@ class Player {
     updatePhysics(gamepad: u8): void {
         // Get the just-pressed buttons (not held)
         const justPressed = gamepad & (gamepad ^ prevGamepad);
+
+        // Calculate camera movement this frame for compensation
+        const oldCameraY = cameraY;
+        // We'll handle camera position changes after updating player state
 
         // Apply horizontal movement
         if (gamepad & w4.BUTTON_LEFT) {
@@ -439,33 +760,79 @@ class Player {
             }
         }
 
-        // Jump logic with coyote time and jump squat
-        if ((justPressed & w4.BUTTON_1) && (this.isOnGround || this.coyoteTimeCounter > 0)) {
+        // Get current jump button state
+        const jumpButtonPressed = (gamepad & w4.BUTTON_1) !== 0;
+
+        // Detect button press and release transitions
+        const jumpButtonJustPressed = jumpButtonPressed && !this.prevJumpButton;
+        const jumpButtonJustReleased = !jumpButtonPressed && this.prevJumpButton;
+
+        // Handle jump initiation when button is first pressed
+        if (jumpButtonJustPressed && (this.isOnGround || this.coyoteTimeCounter > 0)) {
             // Start jump squat (pre-jump animation)
             if (this.jumpSquatTimer === 0) {
                 this.jumpSquatTimer = 3; // 3 frames of jump squat
                 this.animState = AnimState.JumpSquat;
+                this.jumpReleased = false; // Player is starting a jump with button held
             }
         }
+
+        // Detect when the jump button is released during a jump
+        if (jumpButtonJustReleased && this.isJumping && !this.jumpReleased) {
+            this.jumpReleased = true;
+        }
+
+        // Save current button state for next frame
+        this.prevJumpButton = jumpButtonPressed;
 
         // Process jump squat
         if (this.jumpSquatTimer > 0) {
             this.jumpSquatTimer--;
 
-            // When jump squat is done, apply the jump
+            // When jump squat is done, apply the initial jump
             if (this.jumpSquatTimer === 0) {
-                this.velocityY = JUMP_FORCE;
+                this.velocityY = INITIAL_JUMP_FORCE; // Start with initial force
                 this.isOnGround = false;
                 this.coyoteTimeCounter = 0;
                 this.animState = AnimState.Jumping;
+                this.isJumping = true;
+                this.jumpHoldTimer = 0;
 
                 // Play jump sound effect
                 w4.tone(200 | (150 << 16), 4, 40, w4.TONE_PULSE1);
             }
         }
 
-        // Apply gravity if not on ground
-        if (!this.isOnGround) {
+        // Variable jump height mechanics
+        if (this.isJumping) {
+            // If still holding jump button and within max hold time (not released yet)
+            if (jumpButtonPressed && !this.jumpReleased && this.jumpHoldTimer < MAX_JUMP_HOLD_FRAMES) {
+                // Apply reduced gravity while holding jump to gain more height
+                this.velocityY += JUMP_HOLD_GRAVITY;
+                this.jumpHoldTimer++;
+
+                // Calculate how far through the jump hold we are (0.0 to 1.0)
+                const jumpProgress = f32(this.jumpHoldTimer) / f32(MAX_JUMP_HOLD_FRAMES);
+
+                // Smoothly interpolate between MIN_JUMP_FORCE and MAX_JUMP_FORCE based on hold time
+                const targetForce = MIN_JUMP_FORCE + (MAX_JUMP_FORCE - MIN_JUMP_FORCE) * jumpProgress;
+
+                // Apply the interpolated force if it would make us go higher (more negative velocity)
+                if (targetForce < this.velocityY) {
+                    this.velocityY = targetForce;
+                }
+            } else {
+                // Apply normal gravity once jump button is released or max hold time reached
+                this.velocityY += GRAVITY;
+            }
+
+            // End jump state when velocity becomes positive (falling)
+            if (this.velocityY >= 0) {
+                this.isJumping = false;
+                this.animState = AnimState.Falling;
+            }
+        } else if (!this.isOnGround) {
+            // Apply normal gravity when not jumping and not on ground
             this.velocityY += GRAVITY;
             // Note: Coyote time is now managed in the ground detection section
         }
@@ -476,6 +843,7 @@ class Player {
         }
 
         // Save old position for collision resolution
+        // Note: We're storing absolute world positions, not screen positions
         const oldX = this.x;
         const oldY = this.y;
 
@@ -491,9 +859,38 @@ class Player {
         for (let i = 0; i < platforms.length; i++) {
             const platform = platforms[i];
 
+            // Check if positions overlap
             if (checkCollision(this.x, this.y, this.width, this.height,
                               platform.x, platform.y, platform.width, platform.height)) {
 
+                // For jump-through platforms, special handling
+                if (platform.isJumpThrough) {
+                    // Only check top collision (landing) for jump-through platforms
+                    const feetY = this.y + this.height;
+                    const platformTopY = platform.y;
+
+                    // If feet were above the platform in the previous frame and now they're passing through
+                    // Note: oldY doesn't include camera movement that happened between frames, so we need to account for that
+                    if (oldY + this.height <= platformTopY && feetY > platformTopY && this.velocityY > 0) {
+                        // Land on the platform
+                        this.y = platformTopY - this.height;
+                        this.velocityY = 0;
+                        this.isOnGround = true;
+                        this.isJumping = false;
+                        this.jumpHoldTimer = 0;
+                        this.jumpReleased = true;
+
+                        // Play landing sound if we weren't on ground before
+                        if (!wasOnGround) {
+                            w4.tone(80 | (60 << 16), 5, 50, w4.TONE_NOISE);
+                        }
+                    }
+
+                    // Skip other collision checks for jump-through platforms
+                    continue;
+                }
+
+                // For regular platforms, check all collision directions
                 // Determine collision direction
                 const overlapLeft = this.x + this.width - platform.x;
                 const overlapRight = platform.x + platform.width - this.x;
@@ -517,6 +914,8 @@ class Player {
                     collisionDir = 3;
                 }
 
+                // We've separated jump-through platform handling above
+                // This is now only for regular platforms
                 // Only register collisions if we were previously not inside the platform
                 // This prevents getting stuck inside platforms
                 if (collisionDir === 0 && this.velocityX > 0 &&
@@ -535,9 +934,16 @@ class Player {
                 }
                 else if (collisionDir === 2 && this.velocityY > 0) {
                     // Top collision (player is landing on platform)
+                    // We've already handled jump-through platforms with special logic
+
                     this.y = platform.y - this.height;
                     this.velocityY = 0;
                     this.isOnGround = true;
+
+                    // Reset jump-related variables on landing
+                    this.isJumping = false;
+                    this.jumpHoldTimer = 0;
+                    this.jumpReleased = true;
 
                     // Play landing sound if we weren't on ground before
                     if (!wasOnGround) {
@@ -546,6 +952,7 @@ class Player {
                 }
                 else if (collisionDir === 3 && this.velocityY < 0) {
                     // Bottom collision (player is hitting head on platform)
+                    // We've already handled jump-through platforms with special logic
                     this.y = platform.y + platform.height;
                     this.velocityY = 0;
                 }
@@ -557,17 +964,61 @@ class Player {
         const tileY = worldToTileY(this.y + this.height + 1); // Check slightly below the player
         const belowTile = getTile(tileX, tileY);
 
-        // Determine if we're on ground - either solid or platform
-        const onGround = isSolidTile(belowTile) || isPlatformTile(belowTile);
+        // Determine if we're on ground
+        // For jump-through tiles, we need to check if the player's feet are actually on top
+        // Additional ground check - see if any platform is directly beneath the player
+        let onPlatform = false;
+        let platformBelowY: f32 = 0;
+
+        // Check all platforms to see if the player is standing on one
+        for (let i = 0; i < platforms.length; i++) {
+            const platform = platforms[i];
+
+            // Only check if player's feet are at or slightly above the platform
+            const feetY = this.y + this.height;
+            const platformTopY = platform.y;
+            // More lenient tolerance when camera is moving up (5 pixels)
+            const tolerance = 5;
+            const withinY = Math.abs(feetY - platformTopY) <= tolerance;
+
+            // Check if player is horizontally over this platform
+            const playerCenterX = this.x + this.width / 2;
+            const overPlatform =
+                playerCenterX >= platform.x &&
+                playerCenterX <= platform.x + platform.width;
+
+            if (withinY && overPlatform && this.velocityY >= 0) {
+                onPlatform = true;
+                platformBelowY = platformTopY;
+                break;
+            }
+        }
+
+        // For tile-based ground detection, check for solid and regular platform tiles
+        const onTileGround = isSolidTile(belowTile) || isPlatformTile(belowTile);
+
+        // Combine both ground detection methods
+        const onGround = onTileGround || onPlatform;
 
         if (onGround && this.velocityY >= 0) {
             // Only snap to ground if we're moving down or already on ground
-            const worldY = tileToWorldY(tileY);
-            this.y = worldY - this.height;
+            if (onPlatform) {
+                // Use the platform's Y position for more precise snapping
+                this.y = platformBelowY - this.height;
+            } else {
+                // Use the tile-based position
+                const worldY = tileToWorldY(tileY);
+                this.y = worldY - this.height;
+            }
             this.velocityY = 0;
 
             if (!this.isOnGround) {
                 this.isOnGround = true;
+
+                // Reset jump-related variables on landing
+                this.isJumping = false;
+                this.jumpHoldTimer = 0;
+                this.jumpReleased = true;
 
                 // Start landing animation if falling fast enough
                 if (this.velocityY > 3) {
@@ -669,8 +1120,10 @@ class Player {
 
             case AnimState.JumpSquat:
                 sprite = playerJumpSquat;
-                // Simulate squash by shifting down slightly
-                yOffset = 2;
+                // Use the actual shorter sprite height (10 rows)
+                height = 10;
+                // Align bottom of sprite with floor (so feet stay at same level)
+                yOffset = PLAYER_HEIGHT - 10;
                 break;
 
             case AnimState.Jumping:
@@ -694,15 +1147,29 @@ class Player {
                 sprite = playerStanding;
         }
 
-        // Draw player with correct facing direction
+        // Draw player with correct facing direction and camera offset
         const flags = this.facingLeft ? w4.BLIT_FLIP_X : 0;
-        // Apply the y-offset for squash and stretch effects without distorting the sprite
-        w4.blit(sprite, i32(this.x), i32(this.y) + yOffset, u32(PLAYER_WIDTH), u32(PLAYER_HEIGHT), w4.BLIT_1BPP | flags);
+        // Apply the y-offset and use the dynamic height for special animations
+        // The player's Y position is offset by the camera position
+        w4.blit(sprite, i32(this.x), i32(this.y - cameraY) + yOffset, u32(width), u32(height), w4.BLIT_1BPP | flags);
     }
 }
 
 // Create player instance
 const player = new Player();
+
+// Initialize lava drops
+function initLavaDrops(): void {
+    lavaDrops.length = 0; // Clear any existing drops
+    for (let i = 0; i < MAX_LAVA_DROPS; i++) {
+        // Distribute drops evenly from top to bottom of screen
+        const yPos = f32(i * (w4.SCREEN_SIZE / MAX_LAVA_DROPS));
+        lavaDrops.push(new LavaDrop(yPos));
+    }
+}
+
+// Initialize lava at game start
+initLavaDrops();
 
 // Game update function - runs at 60fps
 export function update(): void {
@@ -719,8 +1186,23 @@ export function update(): void {
     // Read gamepad
     const gamepad = load<u8>(w4.GAMEPAD1);
 
-    // Update player
+    // First update camera to follow player
+    updateCamera();
+
+    // Then update player with the new camera position
     player.update(gamepad);
+
+    // Update lava
+    updateLava();
+
+    // Check if player touches lava (game over condition)
+    checkLavaCollision();
+
+    // Check if we need to generate more platforms
+    checkGeneratePlatforms();
+
+    // Clean up platforms that are too far below the camera
+    cleanupOffscreenPlatforms();
 
     // Draw game
     drawGame();
@@ -729,33 +1211,272 @@ export function update(): void {
     prevGamepad = gamepad;
 }
 
-// Draw the game
-function drawGame(): void {
-    // Draw the tilemap
-    for (let y = 0; y < LEVEL_HEIGHT; y++) {
-        for (let x = 0; x < LEVEL_WIDTH; x++) {
-            const tile = getTile(x, y);
-            if (tile === TileType.Empty) continue; // Skip empty tiles
+// Update camera to follow player vertically
+function updateCamera(): void {
+    // Target position: keep player in the middle of the screen vertically
+    // But only follow upward movement, never move camera down
+    const targetCameraY = player.y - f32(w4.SCREEN_SIZE / 2);
 
-            let sprite: usize;
-            if (tile === TileType.Solid) {
-                sprite = tileSolid;
-            } else if (tile === 2) { // Platform left
-                sprite = tilePlatformLeft;
-            } else if (tile === 3) { // Platform middle
-                sprite = tilePlatformMiddle;
-            } else if (tile === 4) { // Platform right
-                sprite = tilePlatformRight;
-            } else {
-                continue;
-            }
+    // If player is above the middle of the screen, adjust camera
+    if (targetCameraY > cameraY) {
+        // Immediate camera follow for falling player
+        cameraY = targetCameraY;
+    } else {
+        // Smooth camera follow for rising player
+        cameraY = cameraY + (targetCameraY - cameraY) * 0.1;
+    }
+}
 
-            const worldX = tileToWorldX(x);
-            const worldY = tileToWorldY(y);
-            store<u16>(w4.DRAW_COLORS, 2); // Color 1 for platforms (dark green)
-            w4.blit(sprite, i32(worldX), i32(worldY), TILE_SIZE, TILE_SIZE, w4.BLIT_1BPP);
+// Check if we need to generate more platforms
+function checkGeneratePlatforms(): void {
+    // We want platforms to extend above the screen
+    // Determine the highest visible position in tile coordinates
+    const highestVisibleTile = worldToTileY(cameraY);
+
+    // If we need more platforms (leaving some buffer space)
+    if (highestVisibleTile - 8 < highestPlatformY) {
+        // Generate platforms going upward
+        // Start at the current highest platform - some gap
+        const startY = highestPlatformY - 3; // Gap of 3 tiles
+
+        // Generate multiple platforms with increasing height
+        for (let y = startY; y > highestVisibleTile - 15; y -= i32(2 + Math.floor(Math.random() * 3))) {
+            generatePlatform(y);
         }
     }
+}
+
+// Clean up platforms that are far below the screen
+function cleanupOffscreenPlatforms(): void {
+    // Calculate the lowest visible position plus some buffer
+    const lowestVisibleY = cameraY + f32(w4.SCREEN_SIZE + 50);
+
+    // Check each platform and remove if too low
+    for (let i = platforms.length - 1; i >= 0; i--) {
+        if (platforms[i].y > lowestVisibleY) {
+            // Remove platform
+            platforms.splice(i, 1);
+        }
+    }
+}
+
+// Update the lava (rising pool and falling drops)
+function updateLava(): void {
+    // Calculate the lava's distance from the bottom of the screen
+    const lavaScreenDist = lavaY - (cameraY + f32(w4.SCREEN_SIZE));
+
+    // If lava is too far below the screen, apply rubber-band effect
+    if (lavaScreenDist > LAVA_RUBBER_BAND_DISTANCE) {
+        // Calculate how much to speed up the lava (0.0 to 1.0 factor)
+        // Using a squared factor gives more aggressive acceleration
+        const linearFactor = Math.min(
+            (lavaScreenDist - LAVA_RUBBER_BAND_DISTANCE) / LAVA_RUBBER_BAND_DISTANCE,
+            1.0
+        );
+        // Cubic function for extremely aggressive acceleration
+        const rubberBandFactor = linearFactor * linearFactor * linearFactor;
+
+        // Interpolate between min and max speeds based on rubber-band factor
+        // Add a super-speed mode when extremely far behind
+        if (lavaScreenDist > LAVA_RUBBER_BAND_DISTANCE * 15) {
+            // When extremely far behind, move at maximum speed plus a boost
+            currentLavaSpeed = LAVA_RISE_SPEED_MAX * 1.5;
+        } else {
+            // Normal rubber-band interpolation
+            currentLavaSpeed = LAVA_RISE_SPEED_MIN +
+                f32(rubberBandFactor) * (LAVA_RISE_SPEED_MAX - LAVA_RISE_SPEED_MIN);
+        }
+
+        // Play warning sound when rubber-banding
+        if (lavaScreenDist > LAVA_RUBBER_BAND_DISTANCE * 15) {
+            // More frequent and urgent sound for super-speed mode
+            if (i32(lavaY) % 15 === 0) {
+                // Higher pitch alarm sound
+                w4.tone(400 | (300 << 16), 5, 20, w4.TONE_PULSE1);
+            }
+        } else if (i32(lavaY) % 30 === 0) {
+            // Standard warning for normal rubber-band mode
+            w4.tone(100 | (80 << 16), 4, 10, w4.TONE_PULSE2);
+        }
+    } else {
+        // Reset to base speed when close enough
+        currentLavaSpeed = LAVA_RISE_SPEED_MIN;
+    }
+
+    // Raise the lava pool at the calculated speed
+    lavaY -= currentLavaSpeed;
+
+    // Update all lava drops in the stream
+    for (let i = 0; i < lavaDrops.length; i++) {
+        lavaDrops[i].update();
+    }
+}
+
+// Check if player collides with lava (either pool or drops)
+function checkLavaCollision(): void {
+    // Check if player touches the lava pool
+    if (player.y + player.height > lavaY) {
+        // Player touched the lava pool - game over!
+        resetGame();
+    }
+
+    // Check if player touches any lava drop
+    for (let i = 0; i < lavaDrops.length; i++) {
+        const drop = lavaDrops[i];
+
+        // Simple circle-rectangle collision
+        const dropCenterX = drop.x;
+        const dropCenterY = drop.y + drop.size / 2;
+        const dropRadius = drop.size / 2;
+
+        // Find closest point on player's rectangle to the drop's center
+        const closestX = Math.max(player.x, Math.min(dropCenterX, player.x + player.width));
+        const closestY = Math.max(player.y, Math.min(dropCenterY, player.y + player.height));
+
+        // Calculate distance between closest point and drop center
+        const distanceX = dropCenterX - closestX;
+        const distanceY = dropCenterY - closestY;
+        const distanceSquared = distanceX * distanceX + distanceY * distanceY;
+
+        // Check if distance is less than drop radius
+        if (distanceSquared < dropRadius * dropRadius) {
+            // Player touched a lava drop - game over!
+            resetGame();
+        }
+    }
+}
+
+// Reset the game when player dies
+function resetGame(): void {
+    // Reset player position
+    player.x = f32(LEVEL_WIDTH / 2 * TILE_SIZE);
+    player.y = 100;
+    player.velocityX = 0;
+    player.velocityY = 0;
+    player.isOnGround = false;
+
+    // Reset camera
+    cameraY = 0;
+
+    // Reset lava
+    lavaY = 250;
+    currentLavaSpeed = LAVA_RISE_SPEED_MIN;
+
+    // Reset platforms to initial state
+    platforms.length = 0;
+    initPlatforms();
+
+    // Regenerate lava drops
+    initLavaDrops();
+
+    // Play death sound
+    w4.tone(100 | (50 << 16), 15, 100, w4.TONE_NOISE);
+}
+
+// Draw the game
+function drawGame(): void {
+    // Draw platforms
+
+    for (let i = 0; i < platforms.length; i++) {
+        const platform = platforms[i];
+
+        // Skip platforms that are completely off-screen
+        if (platform.y - cameraY > f32(w4.SCREEN_SIZE) ||
+            platform.y + platform.height - cameraY < 0) {
+            continue;
+        }
+
+        // Draw the platform with camera offset
+        const numTiles = platform.tileTypes.length;
+        for (let j = 0; j < numTiles; j++) {
+            const tileType = platform.tileTypes[j];
+            let sprite: usize;
+
+            // Regular platform tiles
+            if (tileType === TileType.PlatformLeft) {
+                sprite = tilePlatformLeft;
+            } else if (tileType === TileType.PlatformMiddle) {
+                sprite = tilePlatformMiddle;
+            } else if (tileType === TileType.PlatformRight) {
+                sprite = tilePlatformRight;
+            }
+            // Regular platform corners and variants
+            else if (tileType === TileType.PlatformCornerLeft) {
+                sprite = tilePlatformCornerLeft;
+            } else if (tileType === TileType.PlatformCornerRight) {
+                sprite = tilePlatformCornerRight;
+            } else if (tileType === TileType.PlatformMiddleVariant1) {
+                sprite = tilePlatformMiddleVariant1;
+            } else if (tileType === TileType.PlatformMiddleVariant2) {
+                sprite = tilePlatformMiddleVariant2;
+            }
+            // Jump-through platform tiles
+            else if (tileType === TileType.JumpThroughLeft) {
+                sprite = tileJumpThroughLeft;
+            } else if (tileType === TileType.JumpThroughMiddle) {
+                sprite = tileJumpThroughMiddle;
+            } else if (tileType === TileType.JumpThroughRight) {
+                sprite = tileJumpThroughRight;
+            }
+            // Jump-through platform corners and variants
+            else if (tileType === TileType.JumpThroughCornerLeft) {
+                sprite = tileJumpThroughCornerLeft;
+            } else if (tileType === TileType.JumpThroughCornerRight) {
+                sprite = tileJumpThroughCornerRight;
+            } else if (tileType === TileType.JumpThroughMiddleVariant1) {
+                sprite = tileJumpThroughMiddleVariant1;
+            } else if (tileType === TileType.JumpThroughMiddleVariant2) {
+                sprite = tileJumpThroughMiddleVariant2;
+            }
+            // Solid blocks
+            else if (tileType === TileType.Solid) {
+                sprite = tileSolid;
+            } else {
+                continue; // Skip empty tiles
+            }
+
+            const tileX = i32(platform.x) + j * TILE_SIZE;
+            const tileY = i32(platform.y - cameraY); // Apply camera offset
+
+            // Use a different color for jump-through platforms
+            if (platform.isJumpThrough) {
+                store<u16>(w4.DRAW_COLORS, 8); // Color 3 (red) for jump-through platforms
+            } else {
+                store<u16>(w4.DRAW_COLORS, 2); // Color 1 (dark green) for regular platforms
+            }
+
+            w4.blit(sprite, tileX, tileY, TILE_SIZE, TILE_SIZE, w4.BLIT_1BPP);
+        }
+    }
+
+    // Draw lava stream drops
+    for (let i = 0; i < lavaDrops.length; i++) {
+        lavaDrops[i].draw();
+    }
+
+    // Draw the lava pool at the bottom with visual feedback for rubber-band effect
+    if (currentLavaSpeed > LAVA_RISE_SPEED_MAX) {
+        // Super-speed mode - rapid pulsating between all colors
+        const frameCount = i32(lavaY * 20) % 4; // Faster animation
+        // Cycle through all colors for an alarming effect
+        const drawColor = frameCount === 0 ? 2 :
+                         frameCount === 1 ? 4 :
+                         frameCount === 2 ? 8 : 2; // Cycle through color indices
+        store<u16>(w4.DRAW_COLORS, drawColor);
+    } else if (currentLavaSpeed > LAVA_RISE_SPEED_MIN + 0.1) {
+        // Normal rubber-band mode - alternate between red and green
+        const frameCount = i32(lavaY * 10) % 10;
+        if (frameCount < 5) {
+            store<u16>(w4.DRAW_COLORS, 8); // Color 3 (red) for normal lava
+        } else {
+            store<u16>(w4.DRAW_COLORS, 4); // Color 1 (green) for pulsating lava
+        }
+    } else {
+        // Normal red color when at regular speed
+        store<u16>(w4.DRAW_COLORS, 8); // Color 3 (red) for lava
+    }
+
+    w4.rect(0, i32(lavaY - cameraY), w4.SCREEN_SIZE, w4.SCREEN_SIZE); // Draw as full width, tall rectangle
 
     // Draw player
     player.draw();
@@ -778,6 +1499,15 @@ function drawGame(): void {
             break;
         case AnimState.Jumping:
             stateText = "JUMPING";
+            if (player.isJumping) {
+                // Show jump hold info
+                if (player.jumpHoldTimer > 0) {
+                    stateText += " " + player.jumpHoldTimer.toString();
+                }
+                if (player.jumpReleased) {
+                    stateText += " REL";
+                }
+            }
             break;
         case AnimState.Falling:
             stateText = "FALLING";
@@ -790,4 +1520,37 @@ function drawGame(): void {
     }
 
     w4.text(stateText, 5, 5);
+
+    // Show vertical velocity and height
+    const velY = i32(player.velocityY * 10).toString();
+    w4.text("VY: " + velY, 5, 130);
+
+    // Show height (negative Y is higher)
+    const height = i32(-player.y / 10).toString();
+    w4.text("HEIGHT: " + height, 5, 140);
+
+    // Show distance to lava and speed
+    const lavaDistance = i32(lavaY - (player.y + player.height)).toString();
+    const lavaSpeed = i32(currentLavaSpeed * 10).toString();
+    w4.text("LAVA: " + lavaDistance + " SPD:" + lavaSpeed, 5, 150);
+
+    // Show grounded state
+    const groundedText = player.isOnGround ? "GROUNDED" : "AIR";
+    w4.text(groundedText, 5, 120);
+
+    // Indicate if the player is on a jump-through platform
+    // Check for jump-through platform collision
+    let onJumpThrough = false;
+    for (let i = 0; i < platforms.length; i++) {
+        if (platforms[i].isJumpThrough &&
+            checkCollision(player.x, player.y, player.width, player.height,
+                          platforms[i].x, platforms[i].y, platforms[i].width, platforms[i].height)) {
+            onJumpThrough = true;
+            break;
+        }
+    }
+
+    if (onJumpThrough) {
+        w4.text("PASS-THRU", 80, 5);
+    }
 }
