@@ -27,8 +27,19 @@ let cameraY: f32 = 0; // Camera Y position (for vertical scrolling)
 let highestPlatformY: i32 = 0; // Track the Y position of the highest platform
 let platformsGenerated: i32 = 0; // Track how many platforms have been generated
 
+// Game flow states
+enum GameState {
+    TitleScreen,
+    Playing,
+    GameOver
+}
+let gameState: GameState = GameState.TitleScreen;
+let gameOverTimer: u32 = 0; // Timer for game over screen
+let showRetryPrompt: boolean = false; // Whether to show "press any key to retry"
+let initialLavaY: f32 = 350; // Starting position of lava (farther below screen)
+
 // Lava state
-let lavaY: f32 = 250; // Starting position of the lava pool (below the screen)
+let lavaY: f32 = initialLavaY; // Start with lava far below the screen for title
 const LAVA_RISE_SPEED_MIN: f32 = 0.2; // Base speed for lava rise
 const LAVA_RISE_SPEED_MAX: f32 = 4.0; // Maximum speed when rubber-banding
 const LAVA_RUBBER_BAND_DISTANCE: f32 = 10; // Distance at which rubber-banding begins
@@ -1168,8 +1179,37 @@ function initLavaDrops(): void {
     }
 }
 
-// Initialize lava at game start
-initLavaDrops();
+// Function to start the game from title screen
+function startGame(): void {
+    gameState = GameState.Playing;
+
+    // Reset lava to starting position (which is higher than title screen position)
+    lavaY = 250;
+
+    // Start lava speed at a trickle
+    currentLavaSpeed = LAVA_RISE_SPEED_MIN * 0.2; // Very slow at first
+
+    // Restore full set of lava drops
+    initLavaDrops();
+
+    // Play game start sound
+    w4.tone(300 | (400 << 16), 8, 80, w4.TONE_TRIANGLE);
+}
+
+// Initialize the game
+// Set lava position to starting position for title screen
+lavaY = initialLavaY;
+// Start with zero lava movement
+currentLavaSpeed = 0;
+// Initialize initial lava drops (fewer for title screen)
+lavaDrops.length = 0;
+for (let i = 0; i < MAX_LAVA_DROPS / 2; i++) {
+    // Distribute drops evenly from top to bottom of screen
+    const yPos = f32(i * (w4.SCREEN_SIZE / (MAX_LAVA_DROPS / 2)));
+    lavaDrops.push(new LavaDrop(yPos));
+}
+// Set initial game state
+gameState = GameState.TitleScreen;
 
 // Game update function - runs at 60fps
 export function update(): void {
@@ -1186,23 +1226,54 @@ export function update(): void {
     // Read gamepad
     const gamepad = load<u8>(w4.GAMEPAD1);
 
-    // First update camera to follow player
-    updateCamera();
+    // Get the just-pressed buttons (not held)
+    const justPressed = gamepad & (gamepad ^ prevGamepad);
 
-    // Then update player with the new camera position
-    player.update(gamepad);
+    // Handle game state transitions based on input
+    if (gameState === GameState.TitleScreen) {
+        // Start the game when any button is pressed on title screen
+        if (justPressed !== 0) {
+            startGame();
+        }
 
-    // Update lava
-    updateLava();
+        // Even on the title screen, we still update player and basic physics
+        // but lava doesn't move up yet
+        updateCamera();
+        player.update(gamepad);
 
-    // Check if player touches lava (game over condition)
-    checkLavaCollision();
+        // Just update lava drops, not the rising lava
+        for (let i = 0; i < lavaDrops.length; i++) {
+            lavaDrops[i].update();
+        }
+    }
+    else if (gameState === GameState.Playing) {
+        // Normal gameplay updates
+        updateCamera();
+        player.update(gamepad);
+        updateLava();
+        checkLavaCollision();
+        checkGeneratePlatforms();
+        cleanupOffscreenPlatforms();
+    }
+    else if (gameState === GameState.GameOver) {
+        // Update the game over timer
+        gameOverTimer++;
 
-    // Check if we need to generate more platforms
-    checkGeneratePlatforms();
+        // Show retry prompt after 60 frames (1 second)
+        if (gameOverTimer > 60 && !showRetryPrompt) {
+            showRetryPrompt = true;
+        }
 
-    // Clean up platforms that are too far below the camera
-    cleanupOffscreenPlatforms();
+        // If retry prompt is showing and any button is pressed, restart
+        if (showRetryPrompt && justPressed !== 0) {
+            resetGame();
+        }
+
+        // Keep updating lava drops for visual effect
+        for (let i = 0; i < lavaDrops.length; i++) {
+            lavaDrops[i].update();
+        }
+    }
 
     // Draw game
     drawGame();
@@ -1346,7 +1417,63 @@ function checkLavaCollision(): void {
     }
 }
 
-// Reset the game when player dies
+// Draw a text box with a border
+function drawTextBox(text: string[], x: i32, y: i32, width: i32, height: i32): void {
+    // Draw box background
+    store<u16>(w4.DRAW_COLORS, 2); // Dark green for background
+    w4.rect(x, y, width, height);
+
+    // Draw border
+    store<u16>(w4.DRAW_COLORS, 8); // Red for border
+    w4.rect(x, y, width, 1); // Top
+    w4.rect(x, y + height - 1, width, 1); // Bottom
+    w4.rect(x, y, 1, height); // Left
+    w4.rect(x + width - 1, y, 1, height); // Right
+
+    // Draw text
+    store<u16>(w4.DRAW_COLORS, 1); // White text
+    for (let i = 0; i < text.length; i++) {
+        const textX = x + (width - text[i].length * 8) / 2; // Center text horizontally
+        const textY = y + 5 + i * 10; // Space lines vertically
+        w4.text(text[i], textX, textY);
+    }
+}
+
+// Draw the title screen
+function drawTitleScreen(): void {
+    const titleText: string[] = [
+        "LAVA HOP!",
+        "",
+        "$20 Claude Code",
+        "3.7 Sonnet",
+        "May 2025",
+        "",
+        "Press any button",
+        "to start"
+    ];
+
+    drawTextBox(titleText, 10, 20, 140, 90);
+}
+
+// Draw the game over screen
+function drawGameOverScreen(): void {
+    const gameOverText: string[] = [
+        "GAME OVER",
+        "",
+        "Height: " + i32(-player.y / 10).toString()
+    ];
+
+    // Add retry prompt after a delay
+    if (showRetryPrompt) {
+        gameOverText.push("");
+        gameOverText.push("Press any button");
+        gameOverText.push("to retry");
+    }
+
+    drawTextBox(gameOverText, 10, 30, 140, 100);
+}
+
+// Reset the game when player dies or at start
 function resetGame(): void {
     // Reset player position
     player.x = f32(LEVEL_WIDTH / 2 * TILE_SIZE);
@@ -1359,8 +1486,8 @@ function resetGame(): void {
     cameraY = 0;
 
     // Reset lava
-    lavaY = 250;
-    currentLavaSpeed = LAVA_RISE_SPEED_MIN;
+    lavaY = initialLavaY;
+    currentLavaSpeed = 0; // Start with no lava movement
 
     // Reset platforms to initial state
     platforms.length = 0;
@@ -1369,12 +1496,24 @@ function resetGame(): void {
     // Regenerate lava drops
     initLavaDrops();
 
+    // Update game state based on context
+    if (gameState === GameState.Playing) {
+        // If dying during gameplay, go to game over screen
+        gameState = GameState.GameOver;
+        gameOverTimer = 0;
+        showRetryPrompt = false;
+    } else {
+        // If resetting from title or game over, stay in title screen
+        gameState = GameState.TitleScreen;
+    }
+
     // Play death sound
     w4.tone(100 | (50 << 16), 15, 100, w4.TONE_NOISE);
 }
 
 // Draw the game
 function drawGame(): void {
+    // Always draw platforms and player regardless of game state
     // Draw platforms
 
     for (let i = 0; i < platforms.length; i++) {
@@ -1519,38 +1658,52 @@ function drawGame(): void {
             stateText = "UNKNOWN";
     }
 
-    w4.text(stateText, 5, 5);
+    // w4.text(stateText, 5, 5);
 
     // Show vertical velocity and height
-    const velY = i32(player.velocityY * 10).toString();
-    w4.text("VY: " + velY, 5, 130);
+    // const velY = i32(player.velocityY * 10).toString();
+    // w4.text("VY: " + velY, 5, 130);
 
     // Show height (negative Y is higher)
-    const height = i32(-player.y / 10).toString();
-    w4.text("HEIGHT: " + height, 5, 140);
+    // const height = i32(-player.y / 10).toString();
+    // w4.text("HEIGHT: " + height, 5, 140);
 
     // Show distance to lava and speed
-    const lavaDistance = i32(lavaY - (player.y + player.height)).toString();
-    const lavaSpeed = i32(currentLavaSpeed * 10).toString();
-    w4.text("LAVA: " + lavaDistance + " SPD:" + lavaSpeed, 5, 150);
+    // const lavaDistance = i32(lavaY - (player.y + player.height)).toString();
+    // const lavaSpeed = i32(currentLavaSpeed * 10).toString();
+    // w4.text("LAVA: " + lavaDistance + " SPD:" + lavaSpeed, 5, 150);
 
-    // Show grounded state
-    const groundedText = player.isOnGround ? "GROUNDED" : "AIR";
-    w4.text(groundedText, 5, 120);
-
-    // Indicate if the player is on a jump-through platform
-    // Check for jump-through platform collision
-    let onJumpThrough = false;
-    for (let i = 0; i < platforms.length; i++) {
-        if (platforms[i].isJumpThrough &&
-            checkCollision(player.x, player.y, player.width, player.height,
-                          platforms[i].x, platforms[i].y, platforms[i].width, platforms[i].height)) {
-            onJumpThrough = true;
-            break;
-        }
+    // Draw game state specific overlays
+    if (gameState === GameState.TitleScreen) {
+        // Draw title screen
+        drawTitleScreen();
     }
+    else if (gameState === GameState.Playing) {
+        // Show gameplay debug info only during actual gameplay
+        // Show grounded state
+        // const groundedText = player.isOnGround ? "GROUNDED" : "AIR";
+        // w4.text(groundedText, 5, 120);
 
-    if (onJumpThrough) {
-        w4.text("PASS-THRU", 80, 5);
+        // Indicate if the player is on a jump-through platform
+        // Check for jump-through platform collision
+        /*
+        let onJumpThrough = false;
+        for (let i = 0; i < platforms.length; i++) {
+            if (platforms[i].isJumpThrough &&
+                checkCollision(player.x, player.y, player.width, player.height,
+                              platforms[i].x, platforms[i].y, platforms[i].width, platforms[i].height)) {
+                onJumpThrough = true;
+                break;
+            }
+        }
+
+        if (onJumpThrough) {
+            w4.text("PASS-THRU", 80, 5);
+        }
+        */
+    }
+    else if (gameState === GameState.GameOver) {
+        // Draw game over screen
+        drawGameOverScreen();
     }
 }
